@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -103,6 +103,40 @@ class TestAlertFlowSyncFailure:
         ):
             await ij._alert_flow_sync_failure("test reason")  # must not raise
 
+    @pytest.mark.asyncio
+    async def test_default_hint_still_points_at_session_and_tor(self):
+        """Baseline (pre-2026-09-07) wording must survive unchanged for the
+        default/generic failure case."""
+        import jobs.infra_jobs as ij
+        with patch(
+            "telegram.telegram_notify.send_admin_alert", new=AsyncMock(return_value=True)
+        ) as mock_alert:
+            await ij._alert_flow_sync_failure("daily_flow_sync_job 비정상 종료 (exit=1)")
+
+        sent_text = mock_alert.call_args[0][0]
+        assert "Tor Browser" in sent_text
+        assert "KRX_SESSION이 유효한지" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_account_blocked_detail_uses_accurate_hint(self):
+        """2026-09-07/09-09 사고: CD010(비밀번호 변경 필요)·CD007(로그인 시도
+        초과 잠금) 둘 다 세션 만료가 아니라 계정이 막힌 상태라 'KRX_SESSION이
+        유효한지 확인하라'는 기본 안내가 틀린 조치를 유도한다 — 실제 KRX
+        원인을 그대로 안내해야 한다. 코드를 하드코딩하지 않고 임의의 상세
+        문구(account_blocked_detail)를 그대로 실어 보내는지 검증한다."""
+        import jobs.infra_jobs as ij
+        with patch(
+            "telegram.telegram_notify.send_admin_alert", new=AsyncMock(return_value=True)
+        ) as mock_alert:
+            await ij._alert_flow_sync_failure(
+                "daily_flow_sync_job 비정상 종료 (exit=1)",
+                account_blocked_detail="[CD007] 패스워드 오류수에 의한 잠금",
+            )
+
+        sent_text = mock_alert.call_args[0][0]
+        assert "[CD007] 패스워드 오류수에 의한 잠금" in sent_text
+        assert "KRX_SESSION 문제 아님" in sent_text
+
 
 # ── jobs/infra_jobs.py:daily_flow_sync_job() 중복 실행 방지 락 ──────────────
 #
@@ -145,6 +179,93 @@ class TestFlowSyncLock:
         import jobs.infra_jobs as ij
         import telegram.telegram_bot as bot
         assert bot._flow_lock is ij.flow_sync_lock
+
+
+# ── jobs/infra_jobs.py:daily_flow_sync_job() — 계정 잠금 알림 문구 분기 ─────
+#
+# 2026-09-07 실사고: KRX 계정이 CD010("비밀번호 변경 필요")으로 로그인을
+# 거부했는데 daily_flow_sync_job은 항상 "KRX_SESSION 만료 의심"으로만
+# 경고/알림을 보내 실제 조치(비밀번호 변경)와 다른 안내를 했다. 2026-09-09
+# 같은 계정이 CD007("로그인 시도 초과로 인한 잠금")로도 막히는 걸 실측 —
+# 특정 코드에 매지 않고 krx_flow_sync.py main()이 남기는 고정 마커("계정
+# 자체가 막힌 상태")를 감지해서, 실제 KRX 원인 문구를 그대로 뽑아 알림에
+# 싣는지 검증한다.
+
+def _fake_proc(stdout: bytes, returncode: int) -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(stdout, None))
+    proc.returncode = returncode
+    return proc
+
+
+class TestDailyFlowSyncAccountBlockedAlert:
+    @pytest.mark.asyncio
+    async def test_cd010_marker_triggers_specific_alert_with_real_detail(self, caplog):
+        import jobs.infra_jobs as ij
+        stdout = (
+            "20:26:14 [ERROR] [flow] KRX 로그인 실패 [CD010] — 계정 자체가 막힌 상태"
+            "(재시도/세션갱신 불가), data.krx.co.kr에서 직접 확인 필요 "
+            "(KRX_SESSION 문제 아님): 패스워드 변경 필요\n"
+        ).encode("utf-8")
+        proc = _fake_proc(stdout, returncode=1)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)), \
+             patch.object(ij, "_alert_flow_sync_failure", new=AsyncMock()) as mock_alert, \
+             caplog.at_level(logging.WARNING, logger="jobs.infra_jobs"):
+            await ij.daily_flow_sync_job()
+
+        mock_alert.assert_called_once()
+        _, kwargs = mock_alert.call_args
+        assert kwargs.get("account_blocked_detail") == "[CD010] 패스워드 변경 필요"
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("CD010" in m and "패스워드 변경 필요" in m for m in warnings)
+        assert not any("세션 만료 의심" in m for m in warnings)
+
+    @pytest.mark.asyncio
+    async def test_cd007_marker_also_detected_not_hardcoded_to_cd010(self, caplog):
+        """2026-09-09 실사고 재현: 다른 에러 코드(CD007)도 같은 고정 마커로
+        잡혀야 한다 — "비밀번호 변경"류 문구에만 반응하면 이 케이스를 놓친다."""
+        import jobs.infra_jobs as ij
+        stdout = (
+            "18:00:47 [ERROR] [flow] KRX 로그인 실패 [CD007] — 계정 자체가 막힌 상태"
+            "(재시도/세션갱신 불가), data.krx.co.kr에서 직접 확인 필요 "
+            "(KRX_SESSION 문제 아님): 패스워드 오류수에 의한 잠금\n"
+        ).encode("utf-8")
+        proc = _fake_proc(stdout, returncode=1)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)), \
+             patch.object(ij, "_alert_flow_sync_failure", new=AsyncMock()) as mock_alert, \
+             caplog.at_level(logging.WARNING, logger="jobs.infra_jobs"):
+            await ij.daily_flow_sync_job()
+
+        mock_alert.assert_called_once()
+        _, kwargs = mock_alert.call_args
+        assert kwargs.get("account_blocked_detail") == "[CD007] 패스워드 오류수에 의한 잠금"
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert not any("세션 만료 의심" in m for m in warnings)
+
+    @pytest.mark.asyncio
+    async def test_generic_failure_keeps_baseline_session_expiry_alert(self):
+        """마커 없는 실패(예: Tor Browser 꺼짐)는 기존 문구를 그대로 유지해야
+        한다 — 2026-08-31 알림 배선을 회귀시키면 안 됨."""
+        import jobs.infra_jobs as ij
+        proc = _fake_proc(b"", returncode=1)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)), \
+             patch.object(ij, "_alert_flow_sync_failure", new=AsyncMock()) as mock_alert:
+            await ij.daily_flow_sync_job()
+
+        mock_alert.assert_called_once()
+        _, kwargs = mock_alert.call_args
+        assert kwargs.get("account_blocked_detail") is None
+
+    @pytest.mark.asyncio
+    async def test_success_sends_no_alert(self):
+        import jobs.infra_jobs as ij
+        stdout = "18:00:05 [INFO] [flow] 완료 — 총 저장: 803건\n".encode("utf-8")
+        proc = _fake_proc(stdout, returncode=0)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)), \
+             patch.object(ij, "_alert_flow_sync_failure", new=AsyncMock()) as mock_alert:
+            await ij.daily_flow_sync_job()
+
+        mock_alert.assert_not_called()
 
 
 # ── jobs/infra_jobs.py:_relog_subprocess_line() ─────────────────────────────

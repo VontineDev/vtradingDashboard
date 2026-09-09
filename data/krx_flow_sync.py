@@ -172,6 +172,30 @@ def _isin_from_krx_code(krx_code: str) -> str:
 # --probe <종목코드> 옵션으로 실제 응답 구조를 먼저 확인하세요.
 
 
+class KrxTerminalAuthError(Exception):
+    """재시도/세션갱신 대기로는 절대 복구되지 않는 KRX 로그인 실패.
+
+    예: CD010(비밀번호 변경 필요), CD007(로그인 시도 초과로 인한 잠금) —
+    둘 다 세션 쿠키 문제가 아니라 계정 자체가 data.krx.co.kr에서 막힌
+    상태라 사람이 직접 확인/조치해야 풀린다. 2026-09-07 CD010을 CD003과
+    동일한 일반 실패로 취급해서 세션-만료 오판 → 30분 수동 갱신 대기 →
+    Tor 회로 로테이션까지 총 2시간 26분을 낭비하고서야 exit(1)한 사고로
+    추가했고, 2026-09-09 같은 계정이 CD007로도 잠기는 걸 실측 — 코드가
+    하나가 아니라 "계정이 막히는 여러 원인" 부류라는 게 확인돼 세트로 관리.
+    """
+
+    def __init__(self, err_code: Optional[str], err_msg: str) -> None:
+        self.err_code = err_code
+        self.err_msg = err_msg
+        super().__init__(f"[{err_code}] {err_msg}")
+
+
+# 재시도해도 절대 안 풀리는 로그인 에러 코드 — 발견되는 대로 여기 추가.
+# CD010: "패스워드 변경 필요", CD007: "패스워드 오류수에 의한 잠금".
+# 둘 다 data.krx.co.kr에서 사람이 직접 확인/조치해야 풀린다.
+_TERMINAL_LOGIN_ERROR_CODES = {"CD010", "CD007"}
+
+
 class _KrxDirectFetcher:
     """pykrx 없이 data.krx.co.kr를 직접 호출하는 수급 수집기."""
 
@@ -206,6 +230,9 @@ class _KrxDirectFetcher:
         self._session_wait_exhausted = False
         # LOGOUT 응답 WARNING을 실행당 1회만 남기기 위한 플래그 (종목마다 반복 방지).
         self._logout_warned = False
+        # login() 마지막 실패 원인 — 호출부가 재시도 가능 여부를 판단하는 데 사용.
+        self.last_error_code: Optional[str] = None
+        self.last_error_message: str = ""
         tor_proxy = os.environ.get("TOR_PROXY", "")
         if tor_proxy:
             self._session.proxies = {"http": tor_proxy, "https": tor_proxy}
@@ -248,6 +275,8 @@ class _KrxDirectFetcher:
             # KRX 로그인 성공 응답: "success" 포함 또는 단독 "OK" 응답.
             if "success" in text.lower() or text.strip().upper() == "OK":
                 self._authenticated = True
+                self.last_error_code = None
+                self.last_error_message = ""
                 logger.info("[krx-direct] 로그인 성공")
                 return True
 
@@ -260,8 +289,15 @@ class _KrxDirectFetcher:
             # 안 걸려 성공한 로그인을 실패로 오판정하고 있었다.
             if err_code == "CD001":
                 self._authenticated = True
+                self.last_error_code = None
+                self.last_error_message = ""
                 logger.info("[krx-direct] 로그인 성공 [CD001]")
                 return True
+
+            # 실패 — 호출부(_make_krx_direct/_handle_possible_expiry)가 재시도
+            # 가능 여부를 판단할 수 있게 원인을 기록해둔다.
+            self.last_error_code = err_code
+            self.last_error_message = err_msg
 
             # 실패: KRX 실제 에러 메시지 추출해서 표시
             # CD003("서비스 에러")은 KRX의 범용 인증 실패 코드
@@ -272,11 +308,19 @@ class _KrxDirectFetcher:
                     "data.krx.co.kr에 직접 접속해서 KRX_ID/KRX_PW로 로그인 가능한지 확인하세요. "
                     "openapi.krx.co.kr 계정과 data.krx.co.kr 계정은 별도 가입이 필요합니다."
                 )
+            elif err_code in _TERMINAL_LOGIN_ERROR_CODES:
+                logger.warning(
+                    "[krx-direct] 로그인 실패 [%s]: %s — 세션 만료가 아니라 계정 자체가 "
+                    "막혀있는 상태(재시도/세션갱신으로 복구 불가). data.krx.co.kr에서 "
+                    "직접 조치 필요.", err_code, err_msg,
+                )
             else:
                 logger.warning("[krx-direct] 로그인 실패 [%s]: %s", err_code or "?", err_msg)
             return False
         except Exception as e:
             logger.warning("[krx-direct] 로그인 실패: %s", e)
+            self.last_error_code = None
+            self.last_error_message = str(e)
             return False
 
     def inject_session(self, jsessionid: str, visitor_id: Optional[str] = None) -> None:
@@ -480,7 +524,13 @@ def _make_krx_direct(
         fetcher.inject_session(krx_session, krx_visitor)
     elif krx_id and krx_pw:
         fetcher.warmup()
-        fetcher.login(krx_id, krx_pw)
+        if not fetcher.login(krx_id, krx_pw) and getattr(fetcher, "last_error_code", None) in _TERMINAL_LOGIN_ERROR_CODES:
+            # 재시도/세션갱신 대기로는 절대 안 풀리는 실패 — 여기서 바로 멈추지
+            # 않으면 이후 전종목 fetch가 전부 빈 응답으로 실패하고, 그걸 "세션
+            # 만료"로 오판해 30분 수동 갱신 대기 + Tor 회로 로테이션까지 거치며
+            # 2시간 넘게 낭비한다(2026-09-07 실사고). 로그인 응답에서 이미
+            # 원인이 확정됐으므로 즉시 중단.
+            raise KrxTerminalAuthError(fetcher.last_error_code, fetcher.last_error_message)
     else:
         logger.warning(
             "[krx-direct] KRX_SESSION/KRX_ID/KRX_PW 미설정 — 인증 없이 시도합니다.\n"
@@ -972,6 +1022,14 @@ async def _handle_possible_expiry(
             if probe_rows3:
                 logger.info("[flow] 자동 재로그인으로 복구 — 수집을 재개합니다.")
                 return True
+        elif getattr(fetcher, "last_error_code", None) in _TERMINAL_LOGIN_ERROR_CODES:
+            # 재로그인 자체가 계정 문제로 거부됨 — 세션 쿠키가 아니라 계정이
+            # 막힌 것이므로, 아래 "KRX_SESSION 수동 갱신 대기 30분"은 의미가
+            # 없다(애초에 KRX_SESSION을 안 쓰는 KRX_ID/KRX_PW 구성일 수도 있음).
+            # 여기서 즉시 중단해 나머지 종목들이 같은 실패를 반복하며
+            # Tor 회로 로테이션으로 시간을 더 쓰는 것을 막는다.
+            fetcher._session_wait_exhausted = True
+            raise KrxTerminalAuthError(fetcher.last_error_code, fetcher.last_error_message)
 
     logger.warning(
         "[flow] 세션 만료 감지 (연속 빈 응답 %d건) — "
@@ -1279,10 +1337,24 @@ async def main() -> None:
             )
 
         else:  # krx-direct (기본)
-            total_saved = await run_krx_direct(
-                pool, start, end, args.market, args.max, krx_id, krx_pw, krx_session, krx_visitor,
-                force=args.force,
-            )
+            try:
+                total_saved = await run_krx_direct(
+                    pool, start, end, args.market, args.max, krx_id, krx_pw, krx_session, krx_visitor,
+                    force=args.force,
+                )
+            except KrxTerminalAuthError as e:
+                # 세션 만료가 아니라 계정 자체가 막힌 상태(CD010/CD007 등, 원인은
+                # 실행마다 다를 수 있음) — 재시도해도 안 풀리므로 30분 세션 대기나
+                # Tor 회로 로테이션을 거치지 않고 여기서 바로 중단한다. "계정 자체가
+                # 막힌 상태"라는 문구는 infra_jobs.py의 daily_flow_sync_job이 텔레그램
+                # 알림 문구를 고르는 데 그대로 매칭하므로 표현을 바꾸지 말 것 — 실제
+                # KRX 원인(err_code/err_msg)은 알림에 그대로 실어 보낸다.
+                logger.error(
+                    "[flow] KRX 로그인 실패 [%s] — 계정 자체가 막힌 상태(재시도/세션갱신 "
+                    "불가), data.krx.co.kr에서 직접 확인 필요 (KRX_SESSION 문제 아님): %s",
+                    e.err_code, e.err_msg,
+                )
+                sys.exit(1)
             # --incremental은 항상 "어제"라는 아직 적재 안 된 새 날짜를 대상으로
             # 하므로 정상 동작이면 0건일 수 없다. 0건이면 네트워크/인증이 전부
             # 조용히 실패한 것(예: Tor Browser가 꺼져있어 모든 요청이 연결 자체가

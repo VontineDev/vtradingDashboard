@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -332,13 +333,38 @@ async def daily_flow_sync_job() -> None:
                 env=_env,
             )
             out, _ = await proc.communicate()
+            out_text = out.decode("utf-8", errors="replace") if out else ""
             if proc.returncode == 0:
                 logger.info("[flow-sync] 완료 (exit=0)")
             else:
-                logger.warning("[flow-sync] 비정상 종료 (exit=%d) — KRX_SESSION 만료 의심", proc.returncode)
-                await _alert_flow_sync_failure(f"daily_flow_sync_job 비정상 종료 (exit={proc.returncode})")
-            if out:
-                for line in out.decode("utf-8", errors="replace").splitlines():
+                # krx_flow_sync.py가 KrxTerminalAuthError(CD010 비밀번호 변경
+                # 필요, CD007 로그인 시도 초과 잠금 등 — 원인 코드는 실행마다
+                # 다를 수 있음)로 즉시 중단한 경우, 이건 세션 만료가 아니라
+                # 계정 자체가 막힌 상태라 KRX_SESSION을 아무리 갱신해도 안
+                # 풀린다 (2026-09-07/09-09 실사고: 이 구분 없이 "세션 만료
+                # 의심"으로만 안내해 사람이 엉뚱한 조치를 하며 낭비할 뻔함).
+                # "계정 자체가 막힌 상태"는 krx_flow_sync.py main()의 로그와
+                # 맞춰둔 고정 마커 — 특정 에러 코드에 매지 말 것(다음에 또
+                # 다른 코드가 나올 수 있음). 실제 원인은 로그에서 [코드] 뒤
+                # 메시지를 뽑아 알림에 그대로 실어 보낸다.
+                terminal_match = re.search(
+                    r"KRX 로그인 실패 \[(\S+)\] — 계정 자체가 막힌 상태.*?: (.+)", out_text
+                )
+                if terminal_match:
+                    err_code, err_msg = terminal_match.group(1), terminal_match.group(2).strip()
+                    logger.warning(
+                        "[flow-sync] 비정상 종료 (exit=%d) — KRX 계정 자체가 막힌 상태 "
+                        "[%s]: %s (KRX_SESSION 만료 아님)", proc.returncode, err_code, err_msg,
+                    )
+                    await _alert_flow_sync_failure(
+                        f"daily_flow_sync_job 비정상 종료 (exit={proc.returncode})",
+                        account_blocked_detail=f"[{err_code}] {err_msg}",
+                    )
+                else:
+                    logger.warning("[flow-sync] 비정상 종료 (exit=%d) — KRX_SESSION 만료 의심", proc.returncode)
+                    await _alert_flow_sync_failure(f"daily_flow_sync_job 비정상 종료 (exit={proc.returncode})")
+            if out_text:
+                for line in out_text.splitlines():
                     if line.strip():
                         _relog_subprocess_line(line)
         except Exception as e:
@@ -346,14 +372,27 @@ async def daily_flow_sync_job() -> None:
             await _alert_flow_sync_failure(f"daily_flow_sync_job 실행 실패: {e}")
 
 
-async def _alert_flow_sync_failure(reason: str) -> None:
+async def _alert_flow_sync_failure(reason: str, account_blocked_detail: Optional[str] = None) -> None:
     """daily_flow_sync_job 실패를 텔레그램으로 알림 (Tor Browser 꺼짐 등
     조용히 반복 실패하는 것을 막기 위함). 알림 자체가 실패해도 잡을 죽이지
-    않는다 — best-effort."""
+    않는다 — best-effort.
+
+    account_blocked_detail이 주어지면 원인이 KRX 계정 자체가 막힌 상태(예:
+    CD010 비밀번호 변경 필요, CD007 로그인 시도 초과 잠금 — 코드는 매번 다를
+    수 있어 여기 하드코딩하지 않고 실제 KRX 응답 문구를 그대로 받는다)로
+    확정된 경우 — Tor/KRX_SESSION을 확인해보라는 일반 안내 대신 실제 원인과
+    정확한 조치를 알려준다(2026-09-07/09-09 사고: 잘못된 안내로 사람이 세션
+    쿠키만 갱신 시도하며 낭비할 뻔함).
+    """
     try:
         from telegram.telegram_notify import send_admin_alert
-        await send_admin_alert(
-            f"{reason}\nTor Browser가 켜져있는지, KRX_SESSION이 유효한지 확인하세요."
-        )
+        if account_blocked_detail:
+            hint = (
+                f"KRX 계정 자체가 막힌 상태입니다 {account_blocked_detail} — "
+                "data.krx.co.kr에 직접 로그인해서 확인/조치하세요 (KRX_SESSION 문제 아님)."
+            )
+        else:
+            hint = "Tor Browser가 켜져있는지, KRX_SESSION이 유효한지 확인하세요."
+        await send_admin_alert(f"{reason}\n{hint}")
     except Exception as e:
         logger.debug("[flow-sync] 실패 알림 전송 실패: %s", e)

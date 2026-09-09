@@ -19,10 +19,12 @@ from core.dates import last_trading_day as _last_trading_day
 from core.tor import jittered_delay as _jittered_delay, new_identity as _tor_new_identity
 from data.krx_flow_sync import (
     FlowRecord,
+    KrxTerminalAuthError,
     _KrxDirectFetcher,
     _compute_streaks,
     _fetch_kiwoom_records,
     _handle_possible_expiry,
+    _make_krx_direct,
     _next_streak,
     _parse_int,
     load_csv_records,
@@ -38,6 +40,8 @@ def _bare_fetcher() -> _KrxDirectFetcher:
     fetcher._session = MagicMock()
     fetcher._authenticated = False
     fetcher._logout_warned = False
+    fetcher.last_error_code = None
+    fetcher.last_error_message = ""
     return fetcher
 
 
@@ -236,6 +240,38 @@ class TestLoginMethod:
         with patch.object(fetcher, "_post", side_effect=capture):
             fetcher.login("user", "pw")
         assert call_count[0] == 1  # only one attempt, no retry
+
+    # --- last_error_code tracking (2026-09-07 CD010 incident) ----------------
+
+    def test_cd010_records_terminal_error_code(self):
+        """CD010 ("패스워드 변경 필요") must be recorded on the fetcher so
+        callers (_make_krx_direct/_handle_possible_expiry) can fail fast
+        instead of treating it like a recoverable session expiry."""
+        cd010 = '{"_error_code":"CD010","_error_message":"패스워드 변경 필요"}'.encode("utf-8")
+        result, fetcher = self._run_login(cd010)
+        assert result is False
+        assert fetcher.last_error_code == "CD010"
+        assert fetcher.last_error_message == "패스워드 변경 필요"
+
+    def test_cd003_records_error_code_too(self):
+        """Non-terminal failures also record their code — only the caller
+        decides which codes are terminal, not login() itself."""
+        cd003 = b'{"_error_code":"CD003","_error_message":"service error"}'
+        _, fetcher = self._run_login(cd003)
+        assert fetcher.last_error_code == "CD003"
+
+    def test_success_clears_previously_recorded_error_code(self):
+        """A prior failed attempt's error code must not linger after a
+        subsequent successful login (e.g. auto-relogin recovering)."""
+        fetcher = _bare_fetcher()
+        with patch.object(fetcher, "_post", return_value=b'{"_error_code":"CD010","_error_message":"x"}'):
+            fetcher.login("user", "pw")
+        assert fetcher.last_error_code == "CD010"
+        cd001 = '{"_error_code":"CD001","_error_message":"정상"}'.encode("utf-8")
+        with patch.object(fetcher, "_post", return_value=cd001):
+            result = fetcher.login("user", "pw")
+        assert result is True
+        assert fetcher.last_error_code is None
 
 
 # ── _decode helper ────────────────────────────────────────────────────────────
@@ -924,6 +960,38 @@ class TestHandlePossibleExpiry:
         assert fetcher._session_wait_exhausted is True
 
     @pytest.mark.asyncio
+    async def test_terminal_login_error_raises_instead_of_manual_wait(self, monkeypatch):
+        """2026-09-07 incident: CD010 ("패스워드 변경 필요") on the auto-relogin
+        attempt must abort immediately with KrxTerminalAuthError — not fall
+        through to the 30-min KRX_SESSION wait (which can never succeed for
+        a password-change-required account) and not go through the
+        Tor-rotation retry loop for every remaining ticker afterwards."""
+        monkeypatch.delenv("KRX_SESSION", raising=False)
+        fetcher = _bare_fetcher()
+        fetcher._session_wait_exhausted = False
+
+        def _failing_login(_id, _pw):
+            fetcher.last_error_code = "CD010"
+            fetcher.last_error_message = "패스워드 변경 필요"
+            return False
+
+        with patch.object(fetcher, "fetch_raw", return_value=[]), \
+             patch.object(fetcher, "login", side_effect=_failing_login), \
+             patch("data.krx_flow_sync.new_identity", return_value=False), \
+             patch("asyncio.sleep", new=AsyncMock()) as mock_sleep, \
+             patch("data.krx_flow_sync.refresh_env"):
+            with pytest.raises(KrxTerminalAuthError) as exc_info:
+                await _handle_possible_expiry(
+                    fetcher, consecutive_empty=5, krx_id="testuser", krx_pw="testpw"
+                )
+
+        assert exc_info.value.err_code == "CD010"
+        assert fetcher._session_wait_exhausted is True
+        # The 30-min manual-wait loop sleeps in 30s steps — none of those
+        # must have run, since we should have raised before reaching it.
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_timeout_sets_exhausted_flag_and_returns_false(self, monkeypatch):
         """No KRX_SESSION refresh ever arrives — must give up, not hang forever
         (regression test: an unbounded wait here previously could wedge
@@ -963,6 +1031,61 @@ class TestHandlePossibleExpiry:
         assert result is True
         assert fetcher._session_wait_exhausted is False
         mock_inject.assert_called_once_with("new-session", None)
+
+
+# ── _make_krx_direct() terminal login errors ──────────────────────────────────
+# 2026-09-07 incident: CD010 ("패스워드 변경 필요") on the very first login
+# attempt was silently ignored (return value never checked) — run_krx_direct
+# then spent ~2h26m fetching every ticker, misdiagnosing each empty response
+# as a recoverable session expiry, before exiting 1. _make_krx_direct must
+# now abort immediately for error codes we know can't be fixed by retrying.
+
+class TestMakeKrxDirect:
+    def test_terminal_login_error_raises_immediately(self):
+        fetcher = _bare_fetcher()
+
+        def _fail(krx_id, krx_pw):
+            fetcher.last_error_code = "CD010"
+            fetcher.last_error_message = "패스워드 변경 필요"
+            return False
+
+        with patch("data.krx_flow_sync._KrxDirectFetcher", return_value=fetcher), \
+             patch.object(fetcher, "warmup", return_value=True), \
+             patch.object(fetcher, "login", side_effect=_fail):
+            with pytest.raises(KrxTerminalAuthError) as exc_info:
+                _make_krx_direct("user", "pw")
+
+        assert exc_info.value.err_code == "CD010"
+        assert exc_info.value.err_msg == "패스워드 변경 필요"
+
+    def test_non_terminal_login_failure_does_not_raise(self):
+        """CD003 (bad credentials) is a real failure but not in the terminal
+        set — _make_krx_direct's existing behavior (proceed with an
+        unauthenticated fetcher, let per-ticker handling deal with it) must
+        stay unchanged for codes not explicitly classified as terminal."""
+        fetcher = _bare_fetcher()
+
+        def _fail(krx_id, krx_pw):
+            fetcher.last_error_code = "CD003"
+            fetcher.last_error_message = "service error"
+            return False
+
+        with patch("data.krx_flow_sync._KrxDirectFetcher", return_value=fetcher), \
+             patch.object(fetcher, "warmup", return_value=True), \
+             patch.object(fetcher, "login", side_effect=_fail):
+            result = _make_krx_direct("user", "pw")
+
+        assert result is fetcher
+        assert fetcher.last_error_code == "CD003"
+
+    def test_successful_login_does_not_raise(self):
+        fetcher = _bare_fetcher()
+        with patch("data.krx_flow_sync._KrxDirectFetcher", return_value=fetcher), \
+             patch.object(fetcher, "warmup", return_value=True), \
+             patch.object(fetcher, "login", return_value=True):
+            result = _make_krx_direct("user", "pw")
+
+        assert result is fetcher
 
 
 # ── run_krx_direct() return value ─────────────────────────────────────────────
