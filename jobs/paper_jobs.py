@@ -29,6 +29,11 @@ from data.kiwoom_paper_trader import (
     get_open_or_pending_tickers,
     compute_slot_krw,
     deployable_capital,
+    get_listed_shares,
+    get_halt_watch,
+    record_halt_detected,
+    record_halt_resumed,
+    get_unresolved_halts,
 )
 from telegram.telegram_notify import _get_token, _get_chat_id, _post_message
 
@@ -292,16 +297,56 @@ async def paper_exit_checker_job(db_pool, paper_trader) -> None:
     logger.info("[paper-exit] 오픈 포지션 %d건 exit 체크 시작", len(_open_positions))
 
     # 현재가 조회 — Kiwoom 실 API ka10001 (정규장 중 실시간 가격; 모의투자 서버는 시장데이터 미지원)
+    # 같은 호출 김에 거래정지 여부도 확인(is_trading_halted, 2026-09-12 추가) —
+    # 액면병합 등으로 정지된 종목은 가격이 얼어붙은 채로 남아 그대로 청산 판정에
+    # 넣으면(특히 재개 후 병합비율만큼 가격이 튈 때) 잘못된 hard_stop/trail 발동으로
+    # 이어질 수 있다(208860.KQ 사례). 정지 자체는 일시적이라 is_trading_halted가
+    # 재개 즉시 False로 바뀌는데, 그 시점에 바로 판정을 재개하면 여전히 병합 전
+    # entry_actual/qty 그대로라 위험이 그대로 남는다 — 그래서 정지 감지 시
+    # paper_halt_watch에 상장주식수 스냅샷과 함께 기록해두고, 재개 이후에도
+    # 사람이 resolve(비율 확정)하기 전까지는 계속 스킵한다.
     _all_tickers = list({p["ticker"] for p in _open_positions})
     _prices: dict[str, float] = {}
+    _live_halted: set[str] = set()
     for _tk in _all_tickers:
         await asyncio.sleep(0.5)
         _px = await _loop.run_in_executor(None, paper_trader.get_current_price, _tk)
         if _px:
             _prices[_tk] = float(_px)
-    logger.info("[paper-exit] Kiwoom 현재가 조회: %d/%d 종목", len(_prices), len(_all_tickers))
+        await asyncio.sleep(0.3)
+        if await _loop.run_in_executor(None, paper_trader.is_trading_halted, _tk):
+            _live_halted.add(_tk)
+
+    _resume_alerts: list[str] = []
+    for _tk in _all_tickers:
+        _watch = await get_halt_watch(db_pool, _tk)
+        if _tk in _live_halted:
+            if not _watch:
+                _shares, _par = await get_listed_shares(db_pool, _tk)
+                await record_halt_detected(db_pool, _tk, _shares, _par)
+                logger.warning("[paper-exit] %s 거래정지 최초 감지 — 상장주식수=%s 스냅샷 기록",
+                                _tk, _shares)
+        elif _watch and _watch["resumed_date"] is None and not _watch["resolved"]:
+            await record_halt_resumed(db_pool, _tk)
+            _shares, _ = await get_listed_shares(db_pool, _tk)
+            _before = _watch["listed_shares_before"]
+            if _before and _shares and _shares != _before:
+                _ratio = _before / _shares
+                _hint = (f"상장주식수 {_before:,} → {_shares:,} (비율 추정 ≈{_ratio:.2f}배) — "
+                         f"DART 공시로 정확한 비율 확인 후 scripts/resolve_paper_halt.py로 반영")
+            else:
+                _hint = "상장주식수 변화 없음 — 병합/분할 외 다른 사유일 수 있음, 직접 원인 확인 필요"
+            _resume_alerts.append(f"{_tk}: {_hint}")
+            logger.warning("[paper-exit] %s 거래정지 재개 감지 — %s", _tk, _hint)
+
+    # 실시간 정지 + 재개됐지만 아직 사람이 확정 안 한 것 전부 스킵 대상
+    _unresolved = {h["ticker"] for h in await get_unresolved_halts(db_pool)}
+    _halted = _live_halted | _unresolved
+    logger.info("[paper-exit] Kiwoom 현재가 조회: %d/%d 종목, 청산판정 스킵(정지 관련): %d종목",
+                len(_prices), len(_all_tickers), len(_halted))
 
     _closed, _tp1_fired, _watermark_updated = 0, 0, 0
+    _halted_positions: list[tuple[str, str]] = []  # (ticker, model) — 알림용
 
     for _pos in _open_positions:
         _pos_id       = _pos["id"]
@@ -315,6 +360,11 @@ async def paper_exit_checker_job(db_pool, paper_trader) -> None:
         _watermark    = _pos["watermark"] or _entry
         _signal_date  = _pos["signal_date"]
         _qty          = _pos["qty"] or 0
+
+        if _ticker in _halted:
+            logger.info("[paper-exit] %s 거래정지 의심 — 청산 판정 스킵", _ticker)
+            _halted_positions.append((_ticker, _pos["model"]))
+            continue
 
         if not _entry or _entry <= 0:
             continue
@@ -459,6 +509,34 @@ async def paper_exit_checker_job(db_pool, paper_trader) -> None:
                                     _msg, label="paper-exit", parse_mode=None)
         except Exception as _e:
             logger.warning("[paper-exit] 텔레그램 알림 실패: %s", _e)
+
+    if _halted_positions:
+        try:
+            _lines = "\n".join(f"  {t} ({m})" for t, m in _halted_positions)
+            _msg = (
+                f"⚠️ 거래정지 의심 종목 {len(_halted_positions)}건 — 청산 판정 스킵 ({today})\n"
+                f"{_lines}\n"
+                f"(액면병합 등으로 정지된 경우 재개 후 entry_actual/qty 수동 보정 필요)"
+            )
+            async with httpx.AsyncClient() as _http:
+                await _post_message(_http, _get_token(), _get_chat_id(),
+                                    _msg, label="paper-exit", parse_mode=None)
+        except Exception as _e:
+            logger.warning("[paper-exit] 거래정지 알림 전송 실패: %s", _e)
+
+    if _resume_alerts:
+        try:
+            _lines = "\n".join(f"  {a}" for a in _resume_alerts)
+            _msg = (
+                f"🔔 거래정지 재개 감지 {len(_resume_alerts)}건 — 수동 확정 전까지 청산 판정 계속 스킵 ({today})\n"
+                f"{_lines}\n"
+                f"확정: scripts/resolve_paper_halt.py <티커> --ratio <비율> --apply"
+            )
+            async with httpx.AsyncClient() as _http:
+                await _post_message(_http, _get_token(), _get_chat_id(),
+                                    _msg, label="paper-exit", parse_mode=None)
+        except Exception as _e:
+            logger.warning("[paper-exit] 거래정지 재개 알림 전송 실패: %s", _e)
 
 
 async def paper_eod_sampler_job(db_pool, paper_trader) -> None:
