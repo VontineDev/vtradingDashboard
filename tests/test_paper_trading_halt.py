@@ -77,6 +77,36 @@ class TestIsTradingHalted:
 
 
 # ═════════════════════════════════════════════════════════════
+# record_halt_detected() — 재정지(re-halt) 재무장 쿼리 구조 확인
+# ═════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_record_halt_detected_query_rearms_on_resolved():
+    """resolved=TRUE인 기존 행을 다시 무장(resolved=FALSE, resumed_date=NULL)
+    시키는 조건부 UPDATE가 ON CONFLICT 절에 들어있는지 확인 — 이미
+    resolved=TRUE로 확정됐던 티커가 별개 사유로 다시 정지됐을 때, 두 번째
+    사건이 재개 후 보호를 못 받고 새는 걸 막는 조건이다(실제 쿼리 동작은
+    이 세션에서 실제 Supabase DB로 별도 검증 완료)."""
+    from data.kiwoom_paper_trader import record_halt_detected
+
+    conn = AsyncMock()
+    acq = AsyncMock()
+    acq.__aenter__ = AsyncMock(return_value=conn)
+    acq.__aexit__ = AsyncMock(return_value=False)
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=acq)
+
+    await record_halt_detected(pool, "TEST.KQ", 200, "2500")
+
+    query = conn.execute.call_args.args[0]
+    assert "ON CONFLICT (ticker) DO UPDATE" in query
+    assert "resolved=FALSE" in query
+    assert "resumed_date=NULL" in query
+    assert "WHERE paper_halt_watch.resolved = TRUE" in query
+    assert conn.execute.call_args.args[1:] == ("TEST.KQ", 200, "2500")
+
+
+# ═════════════════════════════════════════════════════════════
 # paper_exit_checker_job() — 정지 의심 종목 스킵 + 텔레그램 알림
 # ═════════════════════════════════════════════════════════════
 

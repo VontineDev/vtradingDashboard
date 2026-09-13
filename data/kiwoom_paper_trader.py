@@ -704,15 +704,27 @@ async def get_halt_watch(pool, ticker: str) -> Optional[dict]:
 async def record_halt_detected(
     pool, ticker: str, listed_shares: Optional[int], par_value: Optional[str],
 ) -> None:
-    """거래정지 최초 감지 — 상장주식수/액면가 스냅샷과 함께 기록.
-    이미 감시 중인 티커면 그대로 둔다(최초 감지 시점 값을 보존해야 나중에
-    재개 시 비교 기준으로 쓸 수 있음)."""
+    """거래정지 감지 — 상장주식수/액면가 스냅샷과 함께 기록.
+
+    이미 미해결(resolved=FALSE) 상태로 감시 중인 티커는 최초 감지 시점 값을
+    보존하기 위해 그대로 둔다. 단, 과거에 resolved=TRUE로 확정됐던 티커가
+    다시 정지되면(별개의 새 기업행위) 새 스냅샷으로 재무장한다 — ticker가
+    PK라 행이 하나뿐인데, 이걸 안 하면 두 번째 사건은 재개 후 보호를 못
+    받고 그대로(첫 사건 때 이미 resolved=TRUE라서 get_unresolved_halts에도
+    안 걸림) 잘못된 entry_actual/qty로 청산될 수 있다."""
     async with pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO paper_halt_watch (ticker, detected_date, listed_shares_before, par_value_before)
             VALUES ($1, CURRENT_DATE, $2, $3)
-            ON CONFLICT (ticker) DO NOTHING
+            ON CONFLICT (ticker) DO UPDATE SET
+                detected_date=EXCLUDED.detected_date,
+                listed_shares_before=EXCLUDED.listed_shares_before,
+                par_value_before=EXCLUDED.par_value_before,
+                resumed_date=NULL,
+                resolved=FALSE,
+                updated_at=NOW()
+            WHERE paper_halt_watch.resolved = TRUE
             """,
             ticker, listed_shares, par_value,
         )

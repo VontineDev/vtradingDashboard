@@ -321,10 +321,12 @@ async def paper_exit_checker_job(db_pool, paper_trader) -> None:
     for _tk in _all_tickers:
         _watch = await get_halt_watch(db_pool, _tk)
         if _tk in _live_halted:
-            if not _watch:
+            if not _watch or _watch["resolved"]:
+                # _watch가 있는데 resolved=TRUE인 경우는 과거 다른 정지 건이
+                # 이미 확정된 뒤 별개로 다시 정지된 것 — 새 스냅샷으로 재무장.
                 _shares, _par = await get_listed_shares(db_pool, _tk)
                 await record_halt_detected(db_pool, _tk, _shares, _par)
-                logger.warning("[paper-exit] %s 거래정지 최초 감지 — 상장주식수=%s 스냅샷 기록",
+                logger.warning("[paper-exit] %s 거래정지 감지 — 상장주식수=%s 스냅샷 기록",
                                 _tk, _shares)
         elif _watch and _watch["resumed_date"] is None and not _watch["resolved"]:
             await record_halt_resumed(db_pool, _tk)
