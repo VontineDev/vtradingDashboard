@@ -417,6 +417,32 @@ class KiwoomPaperTrader:
             logger.warning("[paper] %s 시가 조회 실패: %s", stk_cd, e)
             return None
 
+    def is_trading_halted(self, ticker: str) -> bool:
+        """ka10001 응답 기반 거래정지 근사 판정.
+
+        Kiwoom API엔 정지 여부 전용 필드가 없다 — 2026-09-12 208860.KQ
+        (액면병합으로 09-02부터 매매거래 정지) 조사에서 확인한 대안:
+        정지 종목은 trde_qty(당일 거래량)·open_pric·high_pric·low_pric이
+        전부 '0'으로 온다. 정상 거래 종목(장마감 후 포함, 005930/000660
+        대조 확인)은 이 필드들이 실제 값을 유지한다 — exp_cntr_pric류는
+        동시호가 시간대 외엔 정상 종목도 비어있어 판정 근거로 못 씀.
+        조회 실패 시 False(정상 취급) — 판단 불가로 청산 로직을 막지 않는다.
+        """
+        stk_cd = _to_6digit(ticker)
+        if self._quote_client is None:
+            return False
+        try:
+            data, _ = self._quote_client._post(
+                "/api/dostk/stkinfo", "ka10001",
+                {"stk_cd": stk_cd},
+            )
+            trde_qty  = int(data.get("trde_qty", "0") or "0")
+            open_pric = int(data.get("open_pric", "0") or "0")
+            return trde_qty == 0 and open_pric == 0
+        except Exception as e:
+            logger.warning("[paper] %s 거래정지 여부 조회 실패: %s", stk_cd, e)
+            return False
+
 
 # ── DB 스키마 ─────────────────────────────────────────────────────────────────
 
@@ -651,6 +677,78 @@ async def get_open_slot_count(pool, model: str) -> int:
             model,
         )
     return row["count"]
+
+
+async def get_listed_shares(pool, ticker: str) -> tuple[Optional[int], Optional[str]]:
+    """krx_listings에서 상장주식수/액면가 조회 — 병합·분할 비율 추정용
+    (yfinance_symbol로 조인, paper_positions.ticker와 동일 형식)."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT listed_shares, par_value FROM krx_listings WHERE yfinance_symbol=$1",
+            ticker,
+        )
+    if not row:
+        return None, None
+    return row["listed_shares"], row["par_value"]
+
+
+async def get_halt_watch(pool, ticker: str) -> Optional[dict]:
+    """paper_halt_watch에서 티커 조회 (감시 중이 아니면 None)."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM paper_halt_watch WHERE ticker=$1", ticker,
+        )
+    return dict(row) if row else None
+
+
+async def record_halt_detected(
+    pool, ticker: str, listed_shares: Optional[int], par_value: Optional[str],
+) -> None:
+    """거래정지 감지 — 상장주식수/액면가 스냅샷과 함께 기록.
+
+    이미 미해결(resolved=FALSE) 상태로 감시 중인 티커는 최초 감지 시점 값을
+    보존하기 위해 그대로 둔다. 단, 과거에 resolved=TRUE로 확정됐던 티커가
+    다시 정지되면(별개의 새 기업행위) 새 스냅샷으로 재무장한다 — ticker가
+    PK라 행이 하나뿐인데, 이걸 안 하면 두 번째 사건은 재개 후 보호를 못
+    받고 그대로(첫 사건 때 이미 resolved=TRUE라서 get_unresolved_halts에도
+    안 걸림) 잘못된 entry_actual/qty로 청산될 수 있다."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO paper_halt_watch (ticker, detected_date, listed_shares_before, par_value_before)
+            VALUES ($1, CURRENT_DATE, $2, $3)
+            ON CONFLICT (ticker) DO UPDATE SET
+                detected_date=EXCLUDED.detected_date,
+                listed_shares_before=EXCLUDED.listed_shares_before,
+                par_value_before=EXCLUDED.par_value_before,
+                resumed_date=NULL,
+                resolved=FALSE,
+                updated_at=NOW()
+            WHERE paper_halt_watch.resolved = TRUE
+            """,
+            ticker, listed_shares, par_value,
+        )
+
+
+async def record_halt_resumed(pool, ticker: str) -> None:
+    """거래 재개 최초 감지 — resumed_date 기록(이미 기록됐으면 그대로 둠).
+    resolved=TRUE로 수동 확정되기 전까지는 청산 판정 스킵이 계속된다."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE paper_halt_watch SET resumed_date=CURRENT_DATE, updated_at=NOW() "
+            "WHERE ticker=$1 AND resumed_date IS NULL",
+            ticker,
+        )
+
+
+async def get_unresolved_halts(pool) -> list[dict]:
+    """아직 사람이 확정(resolved)하지 않은 정지 감시 항목 전체 — 실시간 정지
+    여부와 무관하게, 재개됐어도 미확정이면 계속 포함(청산 판정 계속 스킵)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM paper_halt_watch WHERE resolved=FALSE"
+        )
+    return [dict(r) for r in rows]
 
 
 async def get_open_or_pending_tickers(pool, model: str) -> set[str]:

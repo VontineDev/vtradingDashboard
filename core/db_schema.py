@@ -345,6 +345,26 @@ CREATE INDEX IF NOT EXISTS idx_sector_daily_stats_date
     ON sector_daily_stats (trade_date DESC);
 """
 
+# 2026-09-12: 액면병합/분할 등으로 매매거래 정지된 종목 추적용 — 208860.KQ
+# (액면병합, 09-02부터 정지) 발견이 계기. paper_exit_checker_job이 정지 감지
+# 시점의 krx_listings.listed_shares/par_value를 스냅샷해두고, 재개가 감지돼도
+# resolved=TRUE로 사람이 수동 확정하기 전까지는 청산 판정을 계속 스킵한다 —
+# 그렇지 않으면 재개 직후 병합비율만큼 튄 가격을 그대로 실제 수익으로 계산해
+# hard_stop/trail이 오발동한다(gen1 문서가 경고한 "근거 없는 근사치로 실전
+# 성과 통계를 오염시키는" 패턴과 동일한 위험).
+_CREATE_PAPER_HALT_WATCH = """
+CREATE TABLE IF NOT EXISTS paper_halt_watch (
+    ticker               TEXT        PRIMARY KEY,
+    detected_date        DATE        NOT NULL,
+    listed_shares_before BIGINT,
+    par_value_before     TEXT,
+    resumed_date         DATE,
+    resolved             BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at           TIMESTAMPTZ DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
 
 # ── RLS 활성화 (Supabase PostgREST 노출 차단) ────────────────────
 # 이 백엔드는 asyncpg 직접 연결(postgres/service_role)을 사용하므로 RLS 영향 없음.
@@ -370,6 +390,7 @@ _RLS_ALWAYS: list[str] = [
     "dart_segments",
     "dart_fundamentals",
     "sector_daily_stats",
+    "paper_halt_watch",
 ]
 
 # init_db 호출 시점에 아직 없을 수 있는 테이블 — DO 블록으로 안전하게 처리
@@ -389,6 +410,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
         await conn.execute(_CREATE_SCHEDULER_TRIGGERS)
         await conn.execute(_CREATE_DART_TABLES)
         await conn.execute(_CREATE_SECTOR_DAILY_STATS)
+        await conn.execute(_CREATE_PAPER_HALT_WATCH)
         await conn.execute(
             "ALTER TABLE chart_signals ADD COLUMN IF NOT EXISTS sector VARCHAR(80) DEFAULT ''"
         )

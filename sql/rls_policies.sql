@@ -25,7 +25,8 @@ DO $$ DECLARE
     'daily_market_snap', 'dart_companies', 'dart_disclosures',
     'dart_xbrl', 'dart_segments', 'dart_fundamentals', 'sector_daily_stats',
     'youtube_mention_raw', 'youtube_attention_scores', 'youtube_mention_forward_returns',
-    'youtube_backfill_queue', 'paper_positions_archive_gen1'
+    'youtube_backfill_queue', 'paper_positions_archive_gen1',
+    'paper_halt_watch'
   ];
 BEGIN
   FOREACH _tbl IN ARRAY _tables LOOP
